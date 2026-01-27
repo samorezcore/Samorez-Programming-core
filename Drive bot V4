@@ -1,0 +1,393 @@
+package org.firstinspires.ftc.teamcode.Teleop;
+
+import com.qualcomm.robotcore.eventloop.opmode.*;
+import com.qualcomm.robotcore.hardware.*;
+import android.graphics.Color;
+
+import com.acmerobotics.dashboard.FtcDashboard;
+import com.acmerobotics.dashboard.telemetry.MultipleTelemetry;
+import com.acmerobotics.dashboard.config.Config;
+
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.firstinspires.ftc.vision.VisionPortal;
+import org.firstinspires.ftc.vision.apriltag.AprilTagDetection;
+import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor;
+
+import com.qualcomm.hardware.rev.RevColorSensorV3;
+
+import java.util.List;
+
+enum SpindexMode { INTAKE, OUTTAKE }
+enum ShooterState { IDLE, MOVE_TO_SLOT, WAIT_FOR_SPINDEX, SERVO_OUT, SERVO_IN }
+
+// ===== DASHBOARD CONFIG FOR PID =====
+@Config
+class ShooterPID {
+    public static double kP = 0.0006;
+    public static double kI = 0.0;
+    public static double kD = 0.00002;
+    public static double kF = 0.00025;
+    public static double targetVelocity = 2800; // ticks/sec
+    public static double maxPower = 1.0;
+}
+
+@TeleOp(name = "TeleOp Full Shoot Any PID", group = "Linear Opmode")
+public class Drive extends LinearOpMode {
+
+    // ================= HARDWARE =================
+    DcMotor FL, FR, BL, BR;
+    DcMotorEx Shooter1, Shooter2, Intake;
+    Servo Transfer, Hood, Spin;
+    RevColorSensorV3 colorSensor;
+
+    // ================= CAMERA =================
+    VisionPortal visionPortal;
+    AprilTagProcessor aprilTag;
+
+    // ================= PID =================
+    static final double HEADING_KP = 0.01;
+    static final double HEADING_KD = 0.002;
+    static final double HEADING_DEADBAND = 1.2;
+    static final double MAX_TURN_POWER = 0.5;
+    double lastHeadingError = 0;
+    long lastPidTime = 0;
+
+    // ================= SPINDEX =================
+    static final double[] SPINDEX_SLOTS = {0.0, 0.45, 0.93, 0.70, 0.23};
+    static final int[] INTAKE_SLOTS = {0, 1, 2};
+    static final int[] OUTTAKE_SLOTS = {3, 4};
+    static final long SLOT_MOVE_DELAY = 400; // ms between moves
+
+    // ================= TRANSFER =================
+    static final double SERVO_OUT = 0.5;
+    static final double SERVO_IN = 0.0;
+    static final long SERVO_OUT_TIME = 370;
+    static final long WAIT_BETWEEN_SHOTS = 460;
+
+    // ================= FIRST SHOT DELAY =================
+    static final long FIRST_SHOT_DELAY = 600; // ms delay before first shot
+
+    // ================= HSV TUNABLE =================
+    public static float GREEN_H_MIN = 150f;
+    public static float GREEN_H_MAX = 165f;
+    public static float GREEN_S_MIN = 0.6f;
+    public static float GREEN_V_MIN = 0.2f;
+
+    public static float PURPLE_H_MIN = 215f;
+    public static float PURPLE_H_MAX = 230f;
+    public static float PURPLE_S_MIN = 0.4f;
+    public static float PURPLE_V_MIN = 0.2f;
+
+    // ================= CONTROLLERS =================
+    SpindexController spindex;
+    ShooterFSM shooterFSM;
+
+    boolean lastA = false; // for debounce
+
+    // Shooter PID variables
+    double shooterIntegral = 0;
+    double shooterLastError = 0;
+    long shooterLastTime = 0;
+
+    @Override
+    public void runOpMode() {
+
+        telemetry = new MultipleTelemetry(telemetry, FtcDashboard.getInstance().getTelemetry());
+
+        // ============== HARDWARE MAP ==============
+        FL = hardwareMap.get(DcMotor.class, "CH_motor1");
+        FR = hardwareMap.get(DcMotor.class, "CH_motor2");
+        BL = hardwareMap.get(DcMotor.class, "CH_motor0");
+        BR = hardwareMap.get(DcMotor.class, "CH_motor3");
+        Shooter1 = hardwareMap.get(DcMotorEx.class, "EH_motor0");
+        Shooter2 = hardwareMap.get(DcMotorEx.class, "EH_motor1");
+        Intake = hardwareMap.get(DcMotorEx.class, "EH_motor2");
+
+        Transfer = hardwareMap.get(Servo.class, "EH_servo4");
+        Hood = hardwareMap.get(Servo.class, "EH_servo3");
+        Spin = hardwareMap.get(Servo.class, "EH_servo5");
+
+        colorSensor = hardwareMap.get(RevColorSensorV3.class, "colorsensor1");
+
+        BL.setDirection(DcMotorSimple.Direction.REVERSE);
+        FL.setDirection(DcMotorSimple.Direction.REVERSE);
+        Intake.setDirection(DcMotorSimple.Direction.REVERSE);
+
+        for (DcMotor m : new DcMotor[]{FL, FR, BL, BR}) {
+            m.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+            m.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        }
+
+        Shooter1.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+        Shooter2.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+        Shooter1.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        Shooter2.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        Intake.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        Intake.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+
+        Transfer.setPosition(SERVO_IN);
+        Hood.setPosition(0);
+
+        // Initialize controllers
+        spindex = new SpindexController();
+        shooterFSM = new ShooterFSM();
+
+        // Start at first intake slot
+        spindex.resetToIntake();
+
+        // ============== CAMERA INIT ==============
+        aprilTag = new AprilTagProcessor.Builder().build();
+        visionPortal = new VisionPortal.Builder()
+                .setCamera(hardwareMap.get(WebcamName.class, "Webcam"))
+                .addProcessor(aprilTag)
+                .build();
+        FtcDashboard.getInstance().startCameraStream(visionPortal, 30);
+
+        waitForStart();
+        lastPidTime = System.currentTimeMillis();
+        shooterLastTime = System.nanoTime();
+
+        // ============== TELEOP LOOP ==============
+        while (opModeIsActive()) {
+
+            // ----- DRIVE -----
+            double drive = -gamepad1.left_stick_y;
+            double strafe = gamepad1.left_stick_x;
+            double rotate = gamepad1.right_stick_x;
+            if (gamepad1.right_bumper) rotate += getAutoHeadingPID();
+
+            double fl = drive + strafe + rotate;
+            double fr = drive - strafe - rotate;
+            double bl = drive - strafe + rotate;
+            double br = drive + strafe - rotate;
+
+            double max = Math.max(1.0, Math.max(Math.abs(fl), Math.max(Math.abs(fr),
+                    Math.max(Math.abs(bl), Math.abs(br)))));
+            FL.setPower(fl / max);
+            FR.setPower(fr / max);
+            BL.setPower(bl / max);
+            BR.setPower(br / max);
+
+            // ----- INPUTS -----
+            boolean intakeOn = gamepad1.right_trigger > 0.2;
+            boolean shooterOn = gamepad1.left_trigger > 0.2;
+
+            // Reset to intake if A button pressed (debounced)
+            if (gamepad1.a && !lastA) spindex.resetToIntake();
+            lastA = gamepad1.a;
+
+            Intake.setPower(intakeOn ? 0.85 : 0);
+
+            // ----- SHOOTER PID CONTROL -----
+            if (shooterOn) {
+                double v1 = Shooter1.getVelocity();
+                double v2 = Shooter2.getVelocity();
+                double velocity = (v1 + v2) / 2.0;
+
+                double error = ShooterPID.targetVelocity - velocity;
+
+                long now = System.nanoTime();
+                double dt = (now - shooterLastTime) / 1e9;
+                shooterLastTime = now;
+                if (dt <= 0) dt = 0.02;
+
+                shooterIntegral += error * dt;
+                double derivative = (error - shooterLastError) / dt;
+                shooterLastError = error;
+
+                double pid = ShooterPID.kP * error + ShooterPID.kI * shooterIntegral + ShooterPID.kD * derivative;
+                double feedforward = ShooterPID.kF * ShooterPID.targetVelocity;
+
+                double power = pid + feedforward;
+                power = Math.max(-ShooterPID.maxPower, Math.min(ShooterPID.maxPower, power));
+
+                Shooter1.setPower(power);
+                Shooter2.setPower(power);
+
+                telemetry.addData("Shooter Target", ShooterPID.targetVelocity);
+                telemetry.addData("Shooter Velocity", velocity);
+                telemetry.addData("Shooter Power", power);
+            } else {
+                Shooter1.setPower(0);
+                Shooter2.setPower(0);
+                shooterIntegral = 0;
+                shooterLastError = 0;
+            }
+
+            Hood.setPosition(shooterOn ? 0.22 : 0);
+
+            // ----- COLOR DETECTION -----
+            int r = colorSensor.red();
+            int g = colorSensor.green();
+            int b = colorSensor.blue();
+            float[] hsv = new float[3];
+            Color.RGBToHSV(r, g, b, hsv);
+            float H = hsv[0], S = hsv[1], V = hsv[2];
+
+            boolean detectedBall = (H >= GREEN_H_MIN && H <= GREEN_H_MAX && S >= GREEN_S_MIN && V >= GREEN_V_MIN)
+                    || (H >= PURPLE_H_MIN && H <= PURPLE_H_MAX && S >= PURPLE_S_MIN && V >= PURPLE_V_MIN);
+
+            // Move spindex only forward if intake is on and a ball is detected
+            if (intakeOn && spindex.mode == SpindexMode.INTAKE && detectedBall) {
+                spindex.nextIntakeSlot();
+            }
+
+            // ----- SHOOTER FSM -----
+            shooterFSM.requestShoot(shooterOn);
+            spindex.update();
+            shooterFSM.update();
+
+            // ----- TELEMETRY -----
+            telemetry.addData("Spindex Mode", spindex.mode);
+            telemetry.addData("Intake Slot", spindex.intakeIndex);
+            telemetry.addData("Shooter State", shooterFSM.state);
+            telemetry.addData("HSV H", H);
+            telemetry.addData("HSV S", S);
+            telemetry.addData("HSV V", V);
+            telemetry.addData("ServoPos", Spin.getPosition());
+            telemetry.addData("DetectedBall", detectedBall);
+            telemetry.update();
+        }
+
+        visionPortal.close();
+    }
+
+    // ================= SPINDEX CONTROLLER =================
+    class SpindexController {
+        SpindexMode mode = SpindexMode.INTAKE;
+        int intakeIndex = 0, outtakeIndex = 0;
+        boolean busy = false;
+        long busyUntil = 0;
+
+        void nextIntakeSlot() {
+            long now = System.currentTimeMillis();
+            if (busy && now < busyUntil) return;
+            if (intakeIndex < INTAKE_SLOTS.length - 1) {
+                intakeIndex++;
+                moveToSlot(INTAKE_SLOTS[intakeIndex]);
+                busy = true;
+                busyUntil = now + SLOT_MOVE_DELAY;
+            }
+        }
+
+        void nextOuttakeSlot() {
+            long now = System.currentTimeMillis();
+            if (busy && now < busyUntil) return;
+            if (outtakeIndex < OUTTAKE_SLOTS.length) {
+                moveToSlot(OUTTAKE_SLOTS[outtakeIndex]);
+                outtakeIndex++;
+                busy = true;
+                busyUntil = now + SLOT_MOVE_DELAY;
+            }
+        }
+
+        void moveToSlot(int slot) {
+            if (slot >= 0 && slot < SPINDEX_SLOTS.length) {
+                Spin.setPosition(SPINDEX_SLOTS[slot]);
+            }
+        }
+
+        void update() {
+            if (busy && System.currentTimeMillis() >= busyUntil) busy = false;
+        }
+
+        void resetToIntake() {
+            mode = SpindexMode.INTAKE;
+            intakeIndex = 0;
+            outtakeIndex = 0;
+            Spin.setPosition(SPINDEX_SLOTS[INTAKE_SLOTS[0]]);
+            busy = false;
+            busyUntil = 0;
+        }
+
+        boolean intakeFull() { return intakeIndex >= INTAKE_SLOTS.length - 1; }
+        boolean outtakeDone() { return outtakeIndex >= OUTTAKE_SLOTS.length; }
+    }
+
+    // ================= SHOOTER FSM =================
+    class ShooterFSM {
+        ShooterState state = ShooterState.IDLE;
+        long timer = 0;
+        boolean firstShot = true;
+
+        void abortToIntake() {
+            state = ShooterState.IDLE;
+            Transfer.setPosition(SERVO_IN);
+            firstShot = true;
+        }
+
+        void requestShoot(boolean shooterHeld) {
+            if (!shooterHeld) {
+                abortToIntake();
+                return;
+            }
+            if (state == ShooterState.IDLE) {
+                Intake.setPower(0);
+                spindex.mode = SpindexMode.OUTTAKE;
+                spindex.outtakeIndex = 0;
+                state = ShooterState.MOVE_TO_SLOT;
+                if (firstShot) timer = System.currentTimeMillis();
+            }
+        }
+
+        void update() {
+            long now = System.currentTimeMillis();
+            switch (state) {
+                case MOVE_TO_SLOT:
+                    if (firstShot) {
+                        if (now - timer >= FIRST_SHOT_DELAY) firstShot = false;
+                        else break;
+                    }
+                    if (!spindex.busy) {
+                        if (spindex.outtakeDone()) state = ShooterState.IDLE;
+                        else {
+                            spindex.nextOuttakeSlot();
+                            state = ShooterState.WAIT_FOR_SPINDEX;
+                        }
+                    }
+                    break;
+
+                case WAIT_FOR_SPINDEX:
+                    if (!spindex.busy) {
+                        timer = now;
+                        state = ShooterState.SERVO_OUT;
+                    }
+                    break;
+
+                case SERVO_OUT:
+                    Transfer.setPosition(SERVO_OUT);
+                    if (now - timer >= SERVO_OUT_TIME) {
+                        Transfer.setPosition(SERVO_IN);
+                        timer = now;
+                        state = ShooterState.SERVO_IN;
+                    }
+                    break;
+
+                case SERVO_IN:
+                    if (now - timer >= WAIT_BETWEEN_SHOTS) {
+                        if (spindex.outtakeDone()) state = ShooterState.IDLE;
+                        else state = ShooterState.MOVE_TO_SLOT;
+                    }
+                    break;
+
+                case IDLE: break;
+            }
+        }
+    }
+
+    // ================= CAMERA PID =================
+    private double getAutoHeadingPID() {
+        List<AprilTagDetection> detections = aprilTag.getDetections();
+        if (detections.isEmpty()) return 0;
+        double error = detections.get(0).ftcPose.bearing;
+        if (Math.abs(error) < HEADING_DEADBAND) return 0;
+        long now = System.currentTimeMillis();
+        double dt = (now - lastPidTime) / 1000.0; if (dt <= 0) dt = 0.02;
+        double derivative = (error - lastHeadingError) / dt;
+        double output = error * HEADING_KP + derivative * HEADING_KD;
+        output = Math.max(-MAX_TURN_POWER, Math.min(MAX_TURN_POWER, output));
+        lastHeadingError = error;
+        lastPidTime = now;
+        return output;
+    }
+}
