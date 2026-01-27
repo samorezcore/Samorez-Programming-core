@@ -9,6 +9,12 @@ import com.acmerobotics.dashboard.telemetry.MultipleTelemetry;
 import com.acmerobotics.dashboard.config.Config;
 
 import com.qualcomm.hardware.rev.RevColorSensorV3;
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.firstinspires.ftc.vision.VisionPortal;
+import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor;
+import org.firstinspires.ftc.vision.apriltag.AprilTagDetection;
+
+import java.util.List;
 
 enum SpindexMode { INTAKE, OUTTAKE }
 
@@ -44,17 +50,17 @@ class ShooterConfig {
     public static double maxPower = 1.0;
 }
 
-// TeleOp class
-@TeleOp(name = "TeleOp Shooter BangBang FSM Presets", group = "Linear OpMode")
+// ===== TELEOP CLASS =====
+@TeleOp(name = "TeleOp Shooter FSM Complete", group = "Linear OpMode")
 public class Drive extends LinearOpMode {
 
-    // ================= HARDWARE =================
+    // ===== HARDWARE =====
     DcMotor FL, FR, BL, BR;
     DcMotorEx Shooter1, Shooter2, Intake;
     Servo Transfer, Hood, Spin;
     RevColorSensorV3 colorSensor;
 
-    // ================= CONSTANTS =================
+    // ===== CONSTANTS =====
     static final double TICKS_PER_REV = 28.0;
     static final double GEAR_RATIO = 1.0;
 
@@ -69,7 +75,7 @@ public class Drive extends LinearOpMode {
     static final long SERVO_OUT_TIME = 420;
     static final long WAIT_BETWEEN_SHOTS = 460;
 
-    // ================= STATE =================
+    // ===== SPINDEX + FSM =====
     SpindexController spindex;
     ShooterFSM shooterFSM;
 
@@ -80,12 +86,23 @@ public class Drive extends LinearOpMode {
     double shooterLastError = 0;
     long shooterLastTime = 0;
 
+    // ===== CAMERA =====
+    VisionPortal visionPortal;
+    AprilTagProcessor aprilTag;
+
+    // Auto-heading PID
+    static final double HEADING_KP = 0.01;
+    static final double HEADING_KD = 0.002;
+    static final double HEADING_DEADBAND = 1.2;
+    static final double MAX_TURN_POWER = 0.5;
+    double lastHeadingError = 0;
+    long lastPidTime = 0;
+
     @Override
     public void runOpMode() {
-
         telemetry = new MultipleTelemetry(telemetry, FtcDashboard.getInstance().getTelemetry());
 
-        // ===== Hardware map =====
+        // ===== HARDWARE MAP =====
         FL = hardwareMap.get(DcMotor.class, "CH_motor1");
         FR = hardwareMap.get(DcMotor.class, "CH_motor2");
         BL = hardwareMap.get(DcMotor.class, "CH_motor0");
@@ -105,9 +122,6 @@ public class Drive extends LinearOpMode {
         FL.setDirection(DcMotorSimple.Direction.REVERSE);
         Intake.setDirection(DcMotorSimple.Direction.REVERSE);
 
-        Shooter1.setDirection(DcMotorSimple.Direction.FORWARD);
-        Shooter2.setDirection(DcMotorSimple.Direction.FORWARD);
-
         for (DcMotor m : new DcMotor[]{FL, FR, BL, BR}) {
             m.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
             m.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
@@ -124,19 +138,29 @@ public class Drive extends LinearOpMode {
         Transfer.setPosition(SERVO_IN);
         Hood.setPosition(0);
 
+        // ===== SPINDEX + FSM =====
         spindex = new SpindexController();
         shooterFSM = new ShooterFSM();
         spindex.resetToIntake();
 
+        // ===== CAMERA INIT =====
+        aprilTag = new AprilTagProcessor.Builder().build();
+        visionPortal = new VisionPortal.Builder()
+                .setCamera(hardwareMap.get(WebcamName.class, "Webcam"))
+                .addProcessor(aprilTag)
+                .build();
+        FtcDashboard.getInstance().startCameraStream(visionPortal, 30);
+
         waitForStart();
         shooterLastTime = System.nanoTime();
+        lastPidTime = System.currentTimeMillis();
 
         while (opModeIsActive()) {
-
-            // ================= DRIVE =================
+            // ===== DRIVE =====
             double drive = -gamepad1.left_stick_y;
             double strafe = gamepad1.left_stick_x;
             double rotate = gamepad1.right_stick_x;
+            if (gamepad1.right_bumper) rotate += getAutoHeadingPID();
 
             double fl = drive + strafe + rotate;
             double fr = drive - strafe - rotate;
@@ -150,7 +174,7 @@ public class Drive extends LinearOpMode {
             BL.setPower(bl / max);
             BR.setPower(br / max);
 
-            // ================= INPUTS =================
+            // ===== INPUTS =====
             boolean intakeOn = gamepad1.right_trigger > 0.2;
             boolean shooterA = gamepad1.left_trigger > 0.2;
             boolean shooterB = gamepad1.left_bumper;
@@ -169,10 +193,8 @@ public class Drive extends LinearOpMode {
 
             Intake.setPower(intakeOn ? 0.85 : 0);
 
-            // ================= SHOOTER CONTROL =================
-            double shooterRPM =
-                    (Shooter1.getVelocity() * 60.0) / (TICKS_PER_REV * GEAR_RATIO);
-
+            // ===== SHOOTER CONTROL =====
+            double shooterRPM = (Shooter1.getVelocity() * 60.0) / (TICKS_PER_REV * GEAR_RATIO);
             double power = 0;
 
             if (shooterActive) {
@@ -207,32 +229,34 @@ public class Drive extends LinearOpMode {
                 shooterLastError = 0;
             }
 
-            // Shooter ready check
             boolean shooterReady = Math.abs(targetRPM - shooterRPM) < 80;
 
-            // ================= COLOR SENSOR =================
+            // ===== COLOR SENSOR =====
             float[] hsv = new float[3];
             Color.RGBToHSV(colorSensor.red(), colorSensor.green(), colorSensor.blue(), hsv);
-
             boolean detectedBall = (hsv[0] > 140 && hsv[1] > 0.4 && hsv[2] > 0.2);
 
             if (intakeOn && detectedBall && !lastDetectedBall)
                 spindex.nextIntakeSlot();
-
             lastDetectedBall = detectedBall;
 
-            // ================= FSM =================
+            // ===== FSM UPDATE =====
             shooterFSM.requestShoot(shooterActive, shooterReady);
             spindex.update();
             shooterFSM.update();
 
-            // ================= TELEMETRY =================
+            // ===== TELEMETRY =====
             telemetry.addData("RPM", shooterRPM);
             telemetry.addData("Target", targetRPM);
+            telemetry.addData("Shooter Power", power);
             telemetry.addData("State", shooterFSM.state);
             telemetry.addData("Hood Pos", Hood.getPosition());
+            telemetry.addData("Intake Slot", spindex.intakeIndex);
+            telemetry.addData("Spindex Mode", spindex.mode);
             telemetry.update();
         }
+
+        visionPortal.close();
     }
 
     // ================= SPINDEX =================
@@ -243,9 +267,7 @@ public class Drive extends LinearOpMode {
         boolean busy = false;
         long busyUntil = 0;
 
-        void moveToSlot(int slot) {
-            Spin.setPosition(SPINDEX_SLOTS[slot]);
-        }
+        void moveToSlot(int slot) { Spin.setPosition(SPINDEX_SLOTS[slot]); }
 
         void nextIntakeSlot() {
             if (busy || intakeIndex >= INTAKE_SLOTS.length - 1) return;
@@ -263,10 +285,7 @@ public class Drive extends LinearOpMode {
             busyUntil = System.currentTimeMillis() + SLOT_MOVE_DELAY;
         }
 
-        void update() {
-            if (busy && System.currentTimeMillis() >= busyUntil)
-                busy = false;
-        }
+        void update() { if (busy && System.currentTimeMillis() >= busyUntil) busy = false; }
 
         void resetToIntake() {
             mode = SpindexMode.INTAKE;
@@ -276,9 +295,7 @@ public class Drive extends LinearOpMode {
             busy = false;
         }
 
-        boolean outtakeDone() {
-            return outtakeIndex >= OUTTAKE_SLOTS.length;
-        }
+        boolean outtakeDone() { return outtakeIndex >= OUTTAKE_SLOTS.length; }
     }
 
     // ================= SHOOTER FSM =================
@@ -287,7 +304,6 @@ public class Drive extends LinearOpMode {
         long timer = 0;
 
         void requestShoot(boolean shooterHeld, boolean shooterReady) {
-
             if (!shooterHeld) {
                 state = ShooterState.IDLE;
                 Transfer.setPosition(SERVO_IN);
@@ -310,37 +326,24 @@ public class Drive extends LinearOpMode {
 
         void update() {
             long now = System.currentTimeMillis();
-
             switch (state) {
-
                 case ARM_FIRST_SLOT:
-                    if (!spindex.busy) {
-                        timer = now;
-                        state = ShooterState.PRE_SHOT_DELAY;
-                    }
+                    if (!spindex.busy) { timer = now; state = ShooterState.PRE_SHOT_DELAY; }
                     break;
 
                 case PRE_SHOT_DELAY:
-                    if (now - timer >= PRE_SHOT_DELAY)
-                        state = ShooterState.MOVE_TO_SLOT;
+                    if (now - timer >= PRE_SHOT_DELAY) state = ShooterState.MOVE_TO_SLOT;
                     break;
 
                 case MOVE_TO_SLOT:
                     if (!spindex.busy) {
-                        if (spindex.outtakeDone())
-                            state = ShooterState.IDLE;
-                        else {
-                            spindex.nextOuttakeSlot();
-                            state = ShooterState.WAIT_FOR_SPINDEX;
-                        }
+                        if (spindex.outtakeDone()) state = ShooterState.IDLE;
+                        else { spindex.nextOuttakeSlot(); state = ShooterState.WAIT_FOR_SPINDEX; }
                     }
                     break;
 
                 case WAIT_FOR_SPINDEX:
-                    if (!spindex.busy) {
-                        timer = now;
-                        state = ShooterState.SERVO_OUT;
-                    }
+                    if (!spindex.busy) { timer = now; state = ShooterState.SERVO_OUT; }
                     break;
 
                 case SERVO_OUT:
@@ -353,13 +356,29 @@ public class Drive extends LinearOpMode {
                     break;
 
                 case SERVO_IN:
-                    if (now - timer >= WAIT_BETWEEN_SHOTS)
-                        state = ShooterState.MOVE_TO_SLOT;
+                    if (now - timer >= WAIT_BETWEEN_SHOTS) state = ShooterState.MOVE_TO_SLOT;
                     break;
 
-                case IDLE:
-                    break;
+                case IDLE: break;
             }
         }
     }
+
+    // ================= AUTO-HEADING PID =================
+    private double getAutoHeadingPID() {
+        List<AprilTagDetection> detections = aprilTag.getDetections();
+        if (detections.isEmpty()) return 0;
+        double error = detections.get(0).ftcPose.bearing;
+        if (Math.abs(error) < HEADING_DEADBAND) return 0;
+        long now = System.currentTimeMillis();
+        double dt = (now - lastPidTime) / 1000.0;
+        if (dt <= 0) dt = 0.02;
+        double derivative = (error - lastHeadingError) / dt;
+        double output = error * HEADING_KP + derivative * HEADING_KD;
+        output = Math.max(-MAX_TURN_POWER, Math.min(MAX_TURN_POWER, output));
+        lastHeadingError = error;
+        lastPidTime = now;
+        return output;
+    }
+
 }
