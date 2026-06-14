@@ -1,0 +1,73 @@
+package org.firstinspires.ftc.teamcode.vasea.control;
+
+import org.firstinspires.ftc.teamcode.vasea.subsystems.PinpointPose;
+import org.firstinspires.ftc.teamcode.vasea.subsystems.TurretMotor;
+import org.firstinspires.ftc.teamcode.vasea.vision.LimelightWrapper;
+
+public class HybridTurretController {
+
+    private final TurretMotor turret;
+    private final PinpointPose pose;
+    private final LimelightWrapper limelight;
+    private final VisionFusion fusion;
+    private final PIDController pid;
+
+    private final double TICKS_PER_RAD;
+
+    private double lastTime = System.nanoTime();
+
+    public HybridTurretController(
+            TurretMotor turret,
+            PinpointPose pose,
+            LimelightWrapper limelight,
+            double ticksPerRad
+    ) {
+        this.turret = turret;
+        this.pose = pose;
+        this.limelight = limelight;
+
+        this.fusion = new VisionFusion(limelight);
+        this.pid = new PIDController(2.6, 0.0, 0.35);
+
+        this.TICKS_PER_RAD = ticksPerRad;
+    }
+
+    public void update(double targetX, double targetY) {
+
+        double now = System.nanoTime();
+        double dt = (now - lastTime) / 1e9;
+        lastTime = now;
+
+        if (dt <= 0) return;
+
+        pose.update();
+
+        double rx = pose.getX();
+        double ry = pose.getY();
+        double heading = pose.getHeading();
+
+        // ===== ODOMETRY =====
+        double dx = targetX - rx;
+        double dy = targetY - ry;
+
+        double odomAngle = Math.atan2(dy, dx);
+
+        // ===== VISION FUSION =====
+        double finalAngle = fusion.fuse(odomAngle, heading);
+
+        // ===== TURRET STATE =====
+        double turretAngle = turret.getAngle(TICKS_PER_RAD);
+
+        double error = normalize(finalAngle - heading - turretAngle);
+
+        double output = pid.update(error, dt);
+
+        turret.setPower(output);
+    }
+
+    private double normalize(double a) {
+        while (a > Math.PI) a -= 2 * Math.PI;
+        while (a < -Math.PI) a += 2 * Math.PI;
+        return a;
+    }
+}
